@@ -1,0 +1,708 @@
+package com.sky22333.skyadb.repository
+
+import android.content.Context
+import com.sky22333.skyadb.R
+import com.sky22333.skyadb.adb.AdbPrivilegeCommands
+import com.sky22333.skyadb.adb.AdbSessionKind
+import com.sky22333.skyadb.adb.FastbootOtgManager
+import com.sky22333.skyadb.adb.KadbManager
+import com.sky22333.skyadb.data.AppSettingsStore
+import com.sky22333.skyadb.data.RecentDeviceStore
+import com.sky22333.skyadb.diagnostics.DiagnosticLogger
+import com.sky22333.skyadb.diagnostics.DiagnosticModule
+import com.sky22333.skyadb.diagnostics.alsoLog
+import com.sky22333.skyadb.i18n.appString
+import com.sky22333.skyadb.model.AdbDevice
+import com.sky22333.skyadb.model.AdbLinkKind
+import com.sky22333.skyadb.model.AdbOperationResult
+import com.sky22333.skyadb.model.AdbPrivilegeReport
+import com.sky22333.skyadb.model.AppInfo
+import com.sky22333.skyadb.model.ConnectionState
+import com.sky22333.skyadb.model.DeviceInfo
+import com.sky22333.skyadb.model.DeviceType
+import com.sky22333.skyadb.model.FastbootDeviceSummary
+import com.sky22333.skyadb.model.PrivilegeCommandResult
+import com.sky22333.skyadb.model.PrivilegeCommandState
+import com.sky22333.skyadb.model.PrivilegeStep
+import com.sky22333.skyadb.model.PrivilegeStepResult
+import com.sky22333.skyadb.model.RemoteFileEntry
+import com.sky22333.skyadb.model.ShellCommandResult
+import com.sky22333.skyadb.model.operationCatching
+import com.sky22333.skyadb.usb.UsbOtgHost
+import com.sky22333.skyadb.usb.UsbOtgMode
+import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import okio.source
+
+interface AdbRepository {
+    val recentDevices: Flow<List<AdbDevice>>
+    val selectedDeviceInfo: Flow<DeviceInfo>
+
+    suspend fun connect(host: String, port: Int): AdbOperationResult<String>
+
+    suspend fun connectUsbOtg(deviceName: String): AdbOperationResult<String>
+
+    suspend fun runFastbootCommand(command: String): AdbOperationResult<String>
+
+    suspend fun fastbootSummary(): AdbOperationResult<FastbootDeviceSummary>
+
+    suspend fun pair(host: String, port: Int, pairingCode: String): AdbOperationResult<Unit>
+
+    suspend fun refreshDeviceInfo(): AdbOperationResult<DeviceInfo>
+
+    suspend fun runShell(command: String): AdbOperationResult<ShellCommandResult>
+
+    /**
+     * 依次执行 ADB 提权命令组：授予权限、启动并编译、屏保、保持 ADB 常开、
+     * 启动 Aerial、设为默认桌面、桌面守护。
+     * [keepAdbEnabled] 为用户是否同意执行「保持 ADB 常开」。
+     * 单条命令失败会跳过继续，最终统一返回逐条结果报告。
+     */
+    suspend fun runAdbPrivilege(keepAdbEnabled: Boolean): AdbOperationResult<AdbPrivilegeReport>
+
+    suspend fun install(
+        apkFile: File,
+        onProgress: ((transferred: Long, total: Long) -> Unit)? = null,
+    ): AdbOperationResult<Unit>
+
+    suspend fun listApps(): AdbOperationResult<List<AppInfo>>
+
+    suspend fun launchApp(packageName: String): AdbOperationResult<Unit>
+
+    suspend fun forceStopApp(packageName: String): AdbOperationResult<Unit>
+
+    suspend fun setAppEnabled(packageName: String, enabled: Boolean): AdbOperationResult<Unit>
+
+    suspend fun exportAppApk(packageName: String, localFile: File): AdbOperationResult<File>
+
+    suspend fun uninstall(packageName: String): AdbOperationResult<Unit>
+
+    suspend fun listFiles(remotePath: String): AdbOperationResult<List<RemoteFileEntry>>
+
+    suspend fun makeDirectory(remotePath: String): AdbOperationResult<Unit>
+
+    suspend fun deleteFile(remotePath: String, isDirectory: Boolean): AdbOperationResult<Unit>
+
+    suspend fun renameFile(remotePath: String, newName: String): AdbOperationResult<Unit>
+
+    suspend fun push(
+        localFile: File,
+        remotePath: String,
+        onProgress: ((transferred: Long, total: Long) -> Unit)? = null,
+    ): AdbOperationResult<Unit>
+
+    suspend fun pull(remotePath: String, localFile: File): AdbOperationResult<Unit>
+
+    suspend fun captureScreenshot(localFile: File): AdbOperationResult<File>
+
+    suspend fun disconnect()
+
+    fun sessionKind(): AdbSessionKind
+
+    fun isActiveUsbDevice(deviceName: String): Boolean
+}
+
+class DefaultAdbRepository(
+    private val appContext: Context,
+    private val kadbManager: KadbManager,
+    private val fastbootOtgManager: FastbootOtgManager,
+    private val usbOtgHost: UsbOtgHost,
+    private val recentDeviceStore: RecentDeviceStore,
+    private val settingsStore: AppSettingsStore,
+) : AdbRepository {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val connectionMutex = Mutex()
+    private val recentDeviceState = MutableStateFlow(emptyList<AdbDevice>())
+    private val deviceInfoState = MutableStateFlow(DeviceInfo())
+
+    override val recentDevices: Flow<List<AdbDevice>> = recentDeviceState.asStateFlow()
+    override val selectedDeviceInfo: Flow<DeviceInfo> = deviceInfoState.asStateFlow()
+
+    init {
+        scope.launch {
+            recentDeviceStore.devices.collect { devices ->
+                connectionMutex.withLock {
+                    val connectedIds =
+                        recentDeviceState.value
+                            .filter { it.connectionState == ConnectionState.Connected }
+                            .map { it.id }
+                            .toSet()
+                    val activeUsb =
+                        recentDeviceState.value.filter {
+                            it.linkKind == AdbLinkKind.UsbOtg &&
+                                it.connectionState == ConnectionState.Connected
+                        }
+                    recentDeviceState.value =
+                        activeUsb +
+                            devices.map { device ->
+                                if (device.id in connectedIds) {
+                                    device.copy(
+                                        connectionState = ConnectionState.Connected,
+                                        lastConnectedText =
+                                            appString(R.string.repo_status_just_connected),
+                                    )
+                                } else {
+                                    device
+                                }
+                            }
+                }
+            }
+        }
+    }
+
+    override suspend fun connect(host: String, port: Int): AdbOperationResult<String> =
+        connectionMutex.withLock {
+            disconnectLocked()
+            val settings = settingsStore.settings.first()
+            val result =
+                kadbManager.connect(
+                    host = host,
+                    port = port,
+                    connectTimeoutMillis = settings.connectionTimeoutSeconds * 1_000,
+                    socketTimeoutMillis = settings.commandTimeoutSeconds * 1_000,
+                )
+            if (result is AdbOperationResult.Success) {
+                persistConnectedDevice(
+                    AdbDevice(
+                        id = "$host:$port",
+                        name = appString(R.string.repo_device_name_android),
+                        host = host,
+                        port = port,
+                        type = DeviceType.Unknown,
+                        connectionState = ConnectionState.Connected,
+                        lastConnectedText = appString(R.string.repo_status_just_connected),
+                        linkKind = AdbLinkKind.Wifi,
+                    )
+                )
+            }
+            return@withLock result.logFailure(DiagnosticModule.WifiAdb, "连接设备", "$host:$port")
+        }
+
+    override suspend fun connectUsbOtg(deviceName: String): AdbOperationResult<String> =
+        connectionMutex.withLock {
+            val device =
+                usbOtgHost.getDevice(deviceName)
+                    ?: return@withLock AdbOperationResult.Failure(
+                        message = appString(R.string.repo_usb_device_disconnected),
+                        suggestion = appString(R.string.repo_usb_device_disconnected_suggestion),
+                    )
+            if (!usbOtgHost.hasPermission(device)) {
+                return@withLock AdbOperationResult.Failure(
+                    message = appString(R.string.repo_usb_permission_missing),
+                    suggestion = appString(R.string.repo_usb_permission_missing_suggestion),
+                )
+            }
+
+            disconnectLocked()
+            val settings = settingsStore.settings.first()
+            val mode =
+                usbOtgHost.attachments.value.firstOrNull { it.deviceName == deviceName }?.mode
+                    ?: return@withLock AdbOperationResult.Failure(
+                        message = appString(R.string.repo_usb_mode_unknown),
+                        suggestion = appString(R.string.repo_usb_mode_unknown_suggestion),
+                    )
+
+            val result =
+                when (mode) {
+                    UsbOtgMode.Adb ->
+                        kadbManager.connectUsb(
+                            usbManager = usbOtgHost.usbManager(),
+                            device = device,
+                            connectTimeoutMillis = settings.connectionTimeoutSeconds * 1_000,
+                            socketTimeoutMillis = settings.commandTimeoutSeconds * 1_000,
+                        )
+                    UsbOtgMode.Fastboot ->
+                        fastbootOtgManager.connect(
+                            usbManager = usbOtgHost.usbManager(),
+                            device = device,
+                        )
+                }
+
+            if (result is AdbOperationResult.Success) {
+                when (mode) {
+                    UsbOtgMode.Adb -> {
+                        persistConnectedDevice(
+                            AdbDevice(
+                                id = "usb-otg:$deviceName",
+                                name = appString(R.string.repo_device_name_usb),
+                                host = "usb-otg",
+                                port = 0,
+                                type = DeviceType.Unknown,
+                                connectionState = ConnectionState.Connected,
+                                lastConnectedText = appString(R.string.repo_status_just_connected),
+                                linkKind = AdbLinkKind.UsbOtg,
+                            )
+                        )
+                    }
+                    UsbOtgMode.Fastboot -> {
+                        kadbManager.markUsbFastbootSession(deviceName)
+                        persistConnectedDevice(
+                            AdbDevice(
+                                id = "fastboot:$deviceName",
+                                name = appString(R.string.repo_device_name_fastboot),
+                                host = "fastboot",
+                                port = 0,
+                                type = DeviceType.Unknown,
+                                connectionState = ConnectionState.Connected,
+                                lastConnectedText =
+                                    appString(R.string.repo_status_fastboot_connected),
+                                linkKind = AdbLinkKind.UsbOtg,
+                            )
+                        )
+                    }
+                }
+            }
+
+            return@withLock result.logFailure(DiagnosticModule.UsbOtg, "USB OTG 连接", deviceName)
+        }
+
+    override suspend fun runFastbootCommand(command: String): AdbOperationResult<String> =
+        connectionMutex.withLock {
+            if (kadbManager.sessionKind() != AdbSessionKind.UsbFastboot) {
+                return@withLock AdbOperationResult.Failure(
+                    message = appString(R.string.repo_not_fastboot),
+                    suggestion = appString(R.string.fastboot_connect_via_usb_otg_suggestion),
+                )
+            }
+            try {
+                fastbootOtgManager
+                    .sendCommand(command)
+                    .logFailure(DiagnosticModule.Fastboot, "Fastboot 命令", command.take(80))
+            } finally {
+                clearClosedFastbootSession()
+            }
+        }
+
+    override suspend fun fastbootSummary(): AdbOperationResult<FastbootDeviceSummary> =
+        connectionMutex.withLock {
+            try {
+                fastbootOtgManager.readSummary().logFailure(DiagnosticModule.Fastboot, "读取设备摘要")
+            } finally {
+                clearClosedFastbootSession()
+            }
+        }
+
+    private suspend fun clearClosedFastbootSession() {
+        if (
+            kadbManager.sessionKind() == AdbSessionKind.UsbFastboot &&
+                fastbootOtgManager.currentDeviceName() == null
+        ) {
+            withContext(NonCancellable) { disconnectLocked() }
+        }
+    }
+
+    override suspend fun pair(
+        host: String,
+        port: Int,
+        pairingCode: String,
+    ): AdbOperationResult<Unit> {
+        return kadbManager
+            .pair(host, port, pairingCode)
+            .logFailure(DiagnosticModule.Pairing, "无线配对", "$host:$port")
+    }
+
+    override suspend fun refreshDeviceInfo(): AdbOperationResult<DeviceInfo> =
+        connectionMutex.withLock {
+            refreshDeviceInfoLocked()
+        }
+
+    private suspend fun refreshDeviceInfoLocked(): AdbOperationResult<DeviceInfo> {
+        if (kadbManager.sessionKind() == AdbSessionKind.UsbFastboot) {
+            return AdbOperationResult.Failure(
+                message = appString(R.string.repo_fastboot_no_device_info),
+                suggestion = appString(R.string.repo_fastboot_no_device_info_suggestion),
+            )
+        }
+        val result = kadbManager.fetchDeviceInfo()
+        if (result is AdbOperationResult.Success) {
+            deviceInfoState.value = result.data
+        } else {
+            deviceInfoState.value = DeviceInfo()
+            markConnectedDevices(ConnectionState.Offline)
+        }
+        return result.logFailure(DiagnosticModule.WifiAdb, "刷新设备信息")
+    }
+
+    override suspend fun runShell(command: String): AdbOperationResult<ShellCommandResult> {
+        if (kadbManager.sessionKind() == AdbSessionKind.UsbFastboot) {
+            return AdbOperationResult.Failure(
+                message = appString(R.string.repo_fastboot_no_shell),
+                suggestion = appString(R.string.repo_fastboot_no_shell_suggestion),
+            )
+        }
+        return kadbManager
+            .shell(command)
+            .logFailure(DiagnosticModule.Shell, "执行 Shell", command.take(80))
+    }
+
+    override suspend fun runAdbPrivilege(
+        keepAdbEnabled: Boolean,
+    ): AdbOperationResult<AdbPrivilegeReport> {
+        if (kadbManager.sessionKind() == AdbSessionKind.UsbFastboot) {
+            return AdbOperationResult.Failure(
+                message = appString(R.string.repo_fastboot_no_shell),
+                suggestion = appString(R.string.repo_fastboot_no_shell_suggestion),
+            )
+        }
+
+        val steps = mutableListOf<PrivilegeStepResult>()
+
+        // 组① 授予 adb 专属权限：逐条执行，失败跳过继续。
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.GrantPermissions,
+                commands =
+                    AdbPrivilegeCommands.grantCommands.map { command ->
+                        runPrivilegeCommand(command)
+                    },
+            )
+
+        // 组② 启动一次，等待 5 秒后编译优化。
+        val launchResult = runPrivilegeCommand(AdbPrivilegeCommands.LAUNCH_COMMAND)
+        delay(AdbPrivilegeCommands.COMPILE_WAIT_MILLIS)
+        val compileResult = runPrivilegeCommand(AdbPrivilegeCommands.COMPILE_COMMAND)
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.CompileOptimize,
+                commands = listOf(launchResult, compileResult),
+            )
+
+        // 组③ 屏保设置：先查询 screensaver_enabled，结果为 "1" 才执行后面两条。
+        val screensaverQuery = runPrivilegeCommand(AdbPrivilegeCommands.SCREENSAVER_QUERY_COMMAND)
+        val screensaverEnabled =
+            screensaverQuery.state == PrivilegeCommandState.SUCCESS &&
+                screensaverQuery.output.trim() == "1"
+        val screensaverCommands =
+            if (screensaverEnabled) {
+                listOf(
+                    runPrivilegeCommand(AdbPrivilegeCommands.SCREENSAVER_COMPONENT_COMMAND),
+                    runPrivilegeCommand(AdbPrivilegeCommands.SCREENSAVER_CONFIG_COMMAND),
+                )
+            } else {
+                emptyList()
+            }
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.Screensaver,
+                commands = listOf(screensaverQuery) + screensaverCommands,
+                skippedReason =
+                    if (screensaverEnabled) {
+                        null
+                    } else {
+                        appString(R.string.adb_privilege_skip_screensaver)
+                    },
+            )
+
+        // 组④ 保持 ADB 常开：用户同意时才执行。
+        val keepAdbCommands =
+            if (keepAdbEnabled) {
+                listOf(runPrivilegeCommand(AdbPrivilegeCommands.KEEP_ADB_COMMAND))
+            } else {
+                emptyList()
+            }
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.KeepAdb,
+                commands = keepAdbCommands,
+                skippedReason =
+                    if (keepAdbEnabled) {
+                        null
+                    } else {
+                        appString(R.string.adb_privilege_skip_keep_adb)
+                    },
+            )
+
+        // 组⑤ 启动 Aerial：输出需含 "Status: ok" 才算成功。
+        val aerialResult =
+            runPrivilegeCommand(
+                AdbPrivilegeCommands.LAUNCH_COMMAND,
+                requireStatusOk = true,
+            )
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.LaunchAerial,
+                commands = listOf(aerialResult),
+            )
+
+        // 组⑥ 设为默认桌面：主命令失败时改用回退命令。
+        val homeRoleResult = runPrivilegeCommand(AdbPrivilegeCommands.DEFAULT_HOME_ROLE_COMMAND)
+        val homeCommands =
+            if (homeRoleResult.state == PrivilegeCommandState.SUCCESS) {
+                listOf(homeRoleResult)
+            } else {
+                listOf(
+                    homeRoleResult,
+                    runPrivilegeCommand(AdbPrivilegeCommands.DEFAULT_HOME_FALLBACK_COMMAND),
+                )
+            }
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.DefaultHome,
+                commands = homeCommands,
+            )
+
+        // 组⑦ 桌面守护：先读当前值，再追加 Aerial（保留原内容，冒号连接），最后启用无障碍。
+        val accessibilityQuery =
+            runPrivilegeCommand(AdbPrivilegeCommands.ACCESSIBILITY_QUERY_COMMAND)
+        val originalValue = accessibilityQuery.output.trim()
+        val mergedValue = AdbPrivilegeCommands.buildAccessibilityServicesValue(originalValue)
+        val accessibilityPut =
+            runPrivilegeCommand(
+                "settings put secure enabled_accessibility_services '$mergedValue'",
+            )
+        val accessibilityEnable =
+            runPrivilegeCommand(AdbPrivilegeCommands.ACCESSIBILITY_ENABLE_COMMAND)
+        steps +=
+            PrivilegeStepResult(
+                step = PrivilegeStep.HomeGuard,
+                commands = listOf(accessibilityQuery, accessibilityPut, accessibilityEnable),
+            )
+
+        val report = AdbPrivilegeReport(steps)
+        if (report.failedCount > 0) {
+            DiagnosticLogger.record(
+                module = DiagnosticModule.Shell,
+                operation = appString(R.string.adb_privilege_log_operation),
+                target = AdbPrivilegeCommands.TARGET_PACKAGE,
+                message = appString(R.string.adb_privilege_log_failed_count, report.failedCount),
+                suggestion = appString(R.string.adb_privilege_log_failed_suggestion),
+            )
+        }
+        return AdbOperationResult.Success(report)
+    }
+
+    /** 执行单条提权命令；失败不会抛出，仅记录结果供跳过继续。 */
+    private suspend fun runPrivilegeCommand(
+        command: String,
+        requireStatusOk: Boolean = false,
+    ): PrivilegeCommandResult {
+        val display = AdbPrivilegeCommands.displayCommand(command)
+        return when (val result = kadbManager.shell(command)) {
+            is AdbOperationResult.Success -> {
+                val shellResult = result.data
+                val combinedOutput =
+                    listOf(shellResult.output, shellResult.errorOutput)
+                        .filter { it.isNotBlank() }
+                        .joinToString("\n")
+                val ok =
+                    shellResult.exitCode == 0 &&
+                        (!requireStatusOk ||
+                            combinedOutput.contains(AdbPrivilegeCommands.STATUS_OK_MARKER))
+                PrivilegeCommandResult(
+                    command = display,
+                    state =
+                        if (ok) {
+                            PrivilegeCommandState.SUCCESS
+                        } else {
+                            PrivilegeCommandState.FAILED
+                        },
+                    output = combinedOutput.take(MaxPrivilegeOutputLength),
+                )
+            }
+            is AdbOperationResult.Failure ->
+                PrivilegeCommandResult(
+                    command = display,
+                    state = PrivilegeCommandState.FAILED,
+                    output =
+                        listOf(result.message, result.suggestion)
+                            .filter { it.isNotBlank() }
+                            .joinToString("：")
+                            .take(MaxPrivilegeOutputLength),
+                )
+        }
+    }
+
+    override suspend fun install(
+        apkFile: File,
+        onProgress: ((transferred: Long, total: Long) -> Unit)?,
+    ): AdbOperationResult<Unit> {
+        return kadbManager
+            .install(apkFile, onProgress)
+            .logFailure(DiagnosticModule.Install, "安装 APK", apkFile.name)
+    }
+
+    override suspend fun listApps(): AdbOperationResult<List<AppInfo>> {
+        return kadbManager.listApps().logFailure(DiagnosticModule.Apps, "读取应用列表")
+    }
+
+    override suspend fun launchApp(packageName: String): AdbOperationResult<Unit> {
+        return kadbManager
+            .launchApp(packageName)
+            .logFailure(DiagnosticModule.Apps, "启动应用", packageName)
+    }
+
+    override suspend fun forceStopApp(packageName: String): AdbOperationResult<Unit> {
+        return kadbManager
+            .forceStopApp(packageName)
+            .logFailure(DiagnosticModule.Apps, "停止应用", packageName)
+    }
+
+    override suspend fun setAppEnabled(
+        packageName: String,
+        enabled: Boolean,
+    ): AdbOperationResult<Unit> {
+        return kadbManager
+            .setAppEnabled(packageName, enabled)
+            .logFailure(DiagnosticModule.Apps, if (enabled) "启用应用" else "冻结应用", packageName)
+    }
+
+    override suspend fun exportAppApk(
+        packageName: String,
+        localFile: File,
+    ): AdbOperationResult<File> {
+        return kadbManager
+            .exportAppApk(packageName, localFile)
+            .logFailure(DiagnosticModule.Apps, "导出 APK", packageName)
+    }
+
+    override suspend fun uninstall(packageName: String): AdbOperationResult<Unit> {
+        return kadbManager
+            .uninstall(packageName)
+            .logFailure(DiagnosticModule.Apps, "卸载应用", packageName)
+    }
+
+    override suspend fun listFiles(remotePath: String): AdbOperationResult<List<RemoteFileEntry>> {
+        return kadbManager
+            .listFiles(remotePath)
+            .logFailure(DiagnosticModule.Files, "读取目录", remotePath)
+    }
+
+    override suspend fun makeDirectory(remotePath: String): AdbOperationResult<Unit> {
+        return kadbManager
+            .makeDirectory(remotePath)
+            .logFailure(DiagnosticModule.Files, "新建文件夹", remotePath)
+    }
+
+    override suspend fun deleteFile(
+        remotePath: String,
+        isDirectory: Boolean,
+    ): AdbOperationResult<Unit> {
+        return kadbManager
+            .deleteFile(remotePath, isDirectory)
+            .logFailure(DiagnosticModule.Files, if (isDirectory) "删除目录" else "删除文件", remotePath)
+    }
+
+    override suspend fun renameFile(remotePath: String, newName: String): AdbOperationResult<Unit> {
+        return kadbManager
+            .renameFile(remotePath, newName)
+            .logFailure(DiagnosticModule.Files, "重命名", remotePath)
+    }
+
+    override suspend fun push(
+        localFile: File,
+        remotePath: String,
+        onProgress: ((transferred: Long, total: Long) -> Unit)?,
+    ): AdbOperationResult<Unit> {
+        return kadbManager
+            .push(localFile, remotePath, onProgress)
+            .logFailure(DiagnosticModule.Files, "推送文件", remotePath)
+    }
+
+    override suspend fun pull(remotePath: String, localFile: File): AdbOperationResult<Unit> {
+        return kadbManager
+            .pull(remotePath, localFile)
+            .logFailure(DiagnosticModule.Files, "拉取文件", remotePath)
+    }
+
+    override suspend fun captureScreenshot(localFile: File): AdbOperationResult<File> {
+        return kadbManager
+            .captureScreenshot(localFile)
+            .logFailure(DiagnosticModule.Screenshot, "截图")
+    }
+
+    override suspend fun disconnect() = connectionMutex.withLock { disconnectLocked() }
+
+    private suspend fun disconnectLocked() {
+        kadbManager.disconnect()
+        fastbootOtgManager.disconnect()
+        kadbManager.clearUsbFastbootSession()
+        val next =
+            recentDeviceState.value.map {
+                it.copy(connectionState = ConnectionState.Disconnected)
+            }
+        recentDeviceState.value = next
+        deviceInfoState.value = DeviceInfo()
+    }
+
+    override fun sessionKind(): AdbSessionKind = kadbManager.sessionKind()
+
+    override fun isActiveUsbDevice(deviceName: String): Boolean {
+        return kadbManager.isActiveUsbDevice(deviceName) ||
+            fastbootOtgManager.currentDeviceName() == deviceName
+    }
+
+    private suspend fun persistConnectedDevice(connectedDevice: AdbDevice) {
+        recentDeviceState.value = upsertRecentDevice(connectedDevice)
+        if (connectedDevice.linkKind == AdbLinkKind.Wifi) {
+            recentDeviceStore.upsert(
+                connectedDevice.copy(connectionState = ConnectionState.Disconnected)
+            )
+        }
+
+        val unknown = appString(R.string.unknown)
+        if (connectedDevice.linkKind == AdbLinkKind.Wifi || connectedDevice.host == "usb-otg") {
+            val infoResult = refreshDeviceInfoLocked()
+            if (infoResult is AdbOperationResult.Success) {
+                val deviceName =
+                    listOf(infoResult.data.brand, infoResult.data.model)
+                        .filter { it != unknown }
+                        .joinToString(" ")
+                        .ifBlank { appString(R.string.repo_device_name_android) }
+                val namedDevice = connectedDevice.copy(name = deviceName)
+                recentDeviceState.value = upsertRecentDevice(namedDevice)
+                if (namedDevice.linkKind == AdbLinkKind.Wifi) {
+                    recentDeviceStore.upsert(
+                        namedDevice.copy(connectionState = ConnectionState.Disconnected)
+                    )
+                }
+            }
+        }
+    }
+
+    private fun upsertRecentDevice(device: AdbDevice): List<AdbDevice> {
+        val others =
+            recentDeviceState.value.filter { it.id != device.id && it.linkKind == AdbLinkKind.Wifi }
+        return (listOf(device) + others).take(MaxRecentDevices)
+    }
+
+    private fun markConnectedDevices(connectionState: ConnectionState) {
+        val next =
+            recentDeviceState.value.map { device ->
+                if (device.connectionState == ConnectionState.Connected) {
+                    device.copy(connectionState = connectionState)
+                } else {
+                    device
+                }
+            }
+        recentDeviceState.value = next
+    }
+
+    private companion object {
+        const val MaxRecentDevices = 8
+        const val MaxPrivilegeOutputLength = 300
+    }
+}
+
+private fun <T> AdbOperationResult<T>.logFailure(
+    module: DiagnosticModule,
+    operation: String,
+    target: String? = null,
+): AdbOperationResult<T> {
+    if (this is AdbOperationResult.Failure) {
+        alsoLog(module, operation, target)
+    }
+    return this
+}
